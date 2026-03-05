@@ -24,7 +24,7 @@ BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 ENGINES       = os.path.join(BASE_DIR, "engines")
 
 NOTICE_SCRIPT = os.path.join(ENGINES, "notice-reader.py")
-NAV_SCRIPT    = "/Users/karansingh22/Documents/pathmate/Pathmate/engines/yolo.py"
+NAV_SCRIPT    = os.path.join(ENGINES, "yolo.py")
 BOOK_SCRIPT   = os.path.join(ENGINES, "bookreader.py")
 
 # ─────────────────────────────────────────────
