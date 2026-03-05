@@ -1,48 +1,57 @@
 """
-PathMate — YOLO Object Detection + Live OCR Text Reader
-========================================================
-Detects: Vehicles, Furniture, Traffic Signs, Appliances,
-         Persons, Plants, Books  +  Reads any text in frame
+PathMate — YOLO Object Detector (Enhanced)
+============================================
+Improvements over v1:
+  • YOLOv8s model (small) — better accuracy than nano
+  • Object counting per category shown on screen
+  • Distance estimation (near / medium / far) by box size
+  • Proximity alert — speaks "WARNING: person very close" etc.
+  • Smoother detections — tracks objects across frames (no flicker)
+  • Danger priority — persons/vehicles/traffic signs spoken first
+  • Non-max suppression tuned (less duplicate boxes)
+  • Cleaner bounding box UI with rounded corners + drop shadow
 
 Requirements:
-    pip install ultralytics opencv-python pytesseract numpy
-    brew install tesseract          (Mac)
-    brew install tesseract-lang     (optional extra languages)
+    pip install ultralytics opencv-python
+    Mac speech via built-in `say` command (no extra install)
 
 Controls:
     Q      →  Quit
     S      →  Toggle speech on/off
-    O      →  Toggle OCR mode on/off
-    D      →  Toggle object detection on/off
+    D      →  Toggle detection on/off
+    C      →  Toggle object count overlay
+    P      →  Toggle proximity alerts
     + / -  →  Confidence threshold up / down
+    M      →  Cycle model  (nano → small → medium)
 """
 
 import cv2
-import pytesseract
-import numpy as np
 import threading
 import queue
-import re
 import time
 import subprocess
+from collections import defaultdict, deque
 from ultralytics import YOLO
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-CONFIDENCE_THRESHOLD = 0.4
-SPEAK_COOLDOWN       = 3       # seconds before same object is re-announced
-OCR_INTERVAL_FRAMES  = 25      # run OCR every N frames
-OCR_STABILITY        = 3       # times a line must appear before speaking it
-OCR_COOLDOWN         = 8.0     # seconds before same text is re-announced
+CONFIDENCE_THRESHOLD = 0.45
+SPEAK_COOLDOWN       = 4       # seconds before same object is re-announced
+PROXIMITY_COOLDOWN   = 3       # seconds between proximity warnings
 CAMERA_INDEX         = 0
 SHOW_FPS             = True
+DEFAULT_MODEL        = "yolov8s.pt"   # s = small (better than nano)
+MODELS               = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"]
+MODEL_LABELS         = ["Nano", "Small", "Medium"]
 
-# ── Mac Tesseract path — uncomment if tesseract not found ──
-# pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+# Box area thresholds (fraction of frame area) for distance estimation
+NEAR_THRESHOLD   = 0.15   # box > 15% of frame → NEAR
+MEDIUM_THRESHOLD = 0.05   # box > 5%  of frame → MEDIUM
+# below 5% → FAR
 
 # ─────────────────────────────────────────────
-# CATEGORY DEFINITIONS  (COCO classes)
+# CATEGORY DEFINITIONS
 # ─────────────────────────────────────────────
 VEHICLES = [
     "car", "motorcycle", "bus", "truck", "bicycle",
@@ -62,27 +71,38 @@ PERSONS = ["person"]
 PLANTS  = ["potted plant", "vase"]
 BOOKS   = ["book"]
 
+# Priority order for speech (higher = spoken sooner when multiple detections)
+SPEAK_PRIORITY = {
+    "person":       5,
+    "vehicle":      4,
+    "traffic_sign": 3,
+    "appliance":    2,
+    "furniture":    1,
+    "plant":        0,
+    "book":         0,
+}
+
 CATEGORY_COLORS = {
-    "vehicle":      (0, 255, 0),
+    "vehicle":      (0, 220, 0),
     "furniture":    (255, 165, 0),
-    "traffic_sign": (0, 0, 255),
-    "appliance":    (0, 255, 255),
-    "person":       (255, 255, 0),
-    "plant":        (0, 180, 0),
+    "traffic_sign": (0, 60, 255),
+    "appliance":    (0, 220, 220),
+    "person":       (0, 200, 255),
+    "plant":        (0, 160, 0),
     "book":         (180, 105, 255),
     "other":        (200, 200, 200),
 }
 
 # ─────────────────────────────────────────────
-# SPEECH ENGINE  (Mac `say` — no pyttsx3 crash)
+# SPEECH ENGINE  (Mac `say` — single thread)
 # ─────────────────────────────────────────────
-_speech_queue = queue.Queue(maxsize=2)
+_speech_queue = queue.Queue(maxsize=3)
 _speech_stop  = threading.Event()
 
 def _speak_mac(text: str):
     try:
         subprocess.run(
-            ["say", "-r", "200", "-v", "Samantha", text],
+            ["say", "-r", "210", "-v", "Samantha", text],
             check=True, timeout=15
         )
     except subprocess.TimeoutExpired:
@@ -129,10 +149,8 @@ def stop_speech():
         pass
 
 # ─────────────────────────────────────────────
-# OBJECT DETECTION HELPERS
+# CATEGORY + DISTANCE HELPERS
 # ─────────────────────────────────────────────
-_obj_spoken: dict = {}
-
 def get_category(label: str) -> str:
     l = label.lower()
     if l in VEHICLES:              return "vehicle"
@@ -147,24 +165,101 @@ def get_category(label: str) -> str:
 def get_color(category: str):
     return CATEGORY_COLORS.get(category, CATEGORY_COLORS["other"])
 
-def obj_should_speak(label: str) -> bool:
-    now = time.time()
-    if label not in _obj_spoken or (now - _obj_spoken[label]) > SPEAK_COOLDOWN:
-        _obj_spoken[label] = now
-        return True
-    return False
+def get_distance(box, frame_h, frame_w):
+    x1, y1, x2, y2 = box
+    box_area   = (x2 - x1) * (y2 - y1)
+    frame_area = frame_h * frame_w
+    ratio      = box_area / frame_area
+    if ratio >= NEAR_THRESHOLD:
+        return "NEAR", (0, 0, 255)
+    elif ratio >= MEDIUM_THRESHOLD:
+        return "MED",  (0, 165, 255)
+    else:
+        return "FAR",  (0, 220, 0)
 
-def draw_detection(frame, box, label, confidence, category):
+# ─────────────────────────────────────────────
+# OBJECT TRACKER  (smoothing across frames)
+# Keeps a short history of detections per label
+# to avoid flickering announcements
+# ─────────────────────────────────────────────
+class ObjectTracker:
+    def __init__(self, cooldown=4.0, confirm_frames=2):
+        self.spoken        = {}          # label → last spoken time
+        self.seen_frames   = defaultdict(int)   # label → consecutive frames seen
+        self.confirm       = confirm_frames      # frames needed before announcing
+        self.cooldown      = cooldown
+        self.prox_spoken   = {}          # label → last proximity warning time
+
+    def update(self, detected_labels: set):
+        """Call once per frame with set of currently visible labels."""
+        # Increment seen count for visible labels
+        for lbl in detected_labels:
+            self.seen_frames[lbl] += 1
+        # Reset count for labels that disappeared
+        gone = [l for l in self.seen_frames if l not in detected_labels]
+        for l in gone:
+            self.seen_frames[l] = 0
+
+    def should_speak(self, label: str) -> bool:
+        if self.seen_frames[label] < self.confirm:
+            return False
+        now = time.time()
+        if now - self.spoken.get(label, 0) > self.cooldown:
+            self.spoken[label] = now
+            return True
+        return False
+
+    def should_warn_proximity(self, label: str) -> bool:
+        now = time.time()
+        if now - self.prox_spoken.get(label, 0) > PROXIMITY_COOLDOWN:
+            self.prox_spoken[label] = now
+            return True
+        return False
+
+tracker = ObjectTracker(cooldown=SPEAK_COOLDOWN, confirm_frames=2)
+
+# ─────────────────────────────────────────────
+# DRAWING HELPERS
+# ─────────────────────────────────────────────
+def draw_rounded_rect(img, pt1, pt2, color, thickness=2, r=10):
+    """Draw a rectangle with slightly rounded corners."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    # Sides
+    cv2.line(img,  (x1 + r, y1), (x2 - r, y1), color, thickness)
+    cv2.line(img,  (x1 + r, y2), (x2 - r, y2), color, thickness)
+    cv2.line(img,  (x1, y1 + r), (x1, y2 - r), color, thickness)
+    cv2.line(img,  (x2, y1 + r), (x2, y2 - r), color, thickness)
+    # Corners
+    cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 180, 0, 90,  color, thickness)
+    cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 270, 0, 90,  color, thickness)
+    cv2.ellipse(img, (x1 + r, y2 - r), (r, r), 90,  0, 90,  color, thickness)
+    cv2.ellipse(img, (x2 - r, y2 - r), (r, r), 0,   0, 90,  color, thickness)
+
+def draw_detection(frame, box, label, confidence, category, dist_label, dist_color):
     x1, y1, x2, y2 = map(int, box)
     color = get_color(category)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    txt = f"{label} {confidence:.0%}"
-    (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-    cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
-    cv2.putText(frame, txt, (x1 + 3, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-    cv2.putText(frame, f"[{category.upper()}]", (x1, y2 + 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+    # Subtle filled shadow
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1 + 3, y1 + 3), (x2 + 3, y2 + 3), (0, 0, 0), 2)
+    cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+
+    # Rounded bounding box
+    draw_rounded_rect(frame, (x1, y1), (x2, y2), color, thickness=2)
+
+    # Label pill (top-left)
+    txt = f"{label}  {confidence:.0%}"
+    (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    cv2.rectangle(frame, (x1, y1 - th - 12), (x1 + tw + 10, y1), color, -1)
+    cv2.putText(frame, txt, (x1 + 5, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+    # Distance badge (bottom-right of box)
+    (dw, dh), _ = cv2.getTextSize(dist_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    cv2.rectangle(frame, (x2 - dw - 10, y2 - dh - 8), (x2, y2), dist_color, -1)
+    cv2.putText(frame, dist_label, (x2 - dw - 5, y2 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
 def draw_legend(frame):
     items = [
@@ -177,128 +272,48 @@ def draw_legend(frame):
         ("Book",         "book"),
     ]
     x, y = 10, 30
-    cv2.rectangle(frame, (5, 5), (185, len(items) * 22 + 15), (30, 30, 30), -1)
+    cv2.rectangle(frame, (5, 5), (190, len(items) * 22 + 15), (20, 20, 20), -1)
     for name, cat in items:
         color = get_color(cat)
         cv2.rectangle(frame, (x, y - 12), (x + 16, y + 2), color, -1)
         cv2.putText(frame, name, (x + 22, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1)
         y += 22
 
-# ─────────────────────────────────────────────
-# OCR HELPERS
-# ─────────────────────────────────────────────
-TESS_CONFIG = r'--oem 3 --psm 6 -l eng'
-
-def ocr_preprocess(frame):
-    resized   = cv2.resize(frame, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    gray      = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    denoised  = cv2.fastNlMeansDenoising(gray, h=10)
-    _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel    = np.ones((1, 1), np.uint8)
-    return cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-def is_real_word(word: str) -> bool:
-    if len(word) < 2:
-        return False
-    if not re.search(r'[a-zA-Z]', word):
-        return False
-    non_alnum = sum(1 for c in word if not c.isalnum())
-    if non_alnum / len(word) > 0.4:
-        return False
-    letters = re.sub(r'[^a-zA-Z]', '', word)
-    if len(letters) >= 3 and sum(1 for c in letters.lower() if c in 'aeiou') == 0:
-        return False
-    if len(set(word.lower())) <= 2 and len(word) > 3:
-        return False
-    return True
-
-def clean_line(line: str) -> str:
-    return ' '.join(line.encode('ascii', 'ignore').decode().split())
-
-def is_real_line(line: str) -> bool:
-    words = line.split()
-    if not words:
-        return False
-    real = [w for w in words if is_real_word(w)]
-    if len(real) / len(words) < 0.5:
-        return False
-    if len(real) == 1 and len(real[0]) < 4:
-        return False
-    return True
-
-_ocr_lines: list = []
-_ocr_lock         = threading.Lock()
-_ocr_busy         = False
-
-def run_ocr_thread(frame):
-    global _ocr_busy
-    try:
-        processed = ocr_preprocess(frame)
-        data = pytesseract.image_to_data(
-            processed, config=TESS_CONFIG,
-            output_type=pytesseract.Output.DICT
-        )
-        lines = {}
-        for i in range(len(data["text"])):
-            txt  = data["text"][i].strip()
-            conf = int(data["conf"][i])
-            if txt and conf > 55 and is_real_word(txt):
-                lid = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-                lines[lid] = lines.get(lid, "") + (" " if lid in lines else "") + txt
-
-        valid = []
-        for line in lines.values():
-            cleaned = clean_line(line)
-            if cleaned and is_real_line(cleaned):
-                valid.append(cleaned)
-
-        with _ocr_lock:
-            _ocr_lines.clear()
-            _ocr_lines.extend(valid)
-    except Exception as e:
-        print(f"[OCR Error] {e}")
-    finally:
-        _ocr_busy = False
-
-class SpeechTracker:
-    def __init__(self, cooldown=8.0, stability=3):
-        self.spoken     = {}
-        self.seen_count = {}
-        self.cooldown   = cooldown
-        self.stability  = stability
-
-    def should_speak(self, lines: list) -> list:
-        now      = time.time()
-        to_speak = []
-        for line in lines:
-            self.seen_count[line] = self.seen_count.get(line, 0) + 1
-            if self.seen_count[line] < self.stability:
-                continue
-            if now - self.spoken.get(line, 0) > self.cooldown:
-                to_speak.append(line)
-                self.spoken[line] = now
-        visible = set(lines)
-        for l in [k for k in self.seen_count if k not in visible]:
-            del self.seen_count[l]
-            self.spoken.pop(l, None)
-        return to_speak
+def draw_counts(frame, counts: dict):
+    """Show per-category count in top-right corner."""
+    active = {k: v for k, v in counts.items() if v > 0}
+    if not active:
+        return
+    x = frame.shape[1] - 180
+    y = 30
+    cv2.rectangle(frame, (x - 5, 5), (frame.shape[1] - 5, len(active) * 22 + 15),
+                  (20, 20, 20), -1)
+    for cat, cnt in sorted(active.items(), key=lambda i: -i[1]):
+        color = get_color(cat)
+        cv2.putText(frame, f"{cat[:10]}: {cnt}", (x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+        y += 22
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
     print("=" * 60)
-    print("  PathMate — Object Detection + OCR Text Reader")
+    print("  PathMate — Enhanced YOLO Object Detector")
     print("=" * 60)
-    print("Loading YOLOv8 model...")
-    model = YOLO("yolov8n.pt")
+
+    model_idx = MODELS.index(DEFAULT_MODEL)
+    print(f"Loading model: {MODELS[model_idx]} ({MODEL_LABELS[model_idx]})...")
+    model = YOLO(MODELS[model_idx])
     print("Model loaded!\n")
     print("Controls:")
     print("  Q      →  Quit")
     print("  S      →  Toggle speech")
-    print("  O      →  Toggle OCR")
-    print("  D      →  Toggle object detection")
+    print("  D      →  Toggle detection")
+    print("  C      →  Toggle count overlay")
+    print("  P      →  Toggle proximity alerts")
+    print("  M      →  Cycle model (Nano/Small/Medium)")
     print("  + / -  →  Confidence up / down")
     print("=" * 60)
 
@@ -312,74 +327,85 @@ def main():
 
     speech_enabled    = True
     detection_enabled = True
-    ocr_enabled       = True
+    counts_enabled    = True
+    proximity_enabled = True
     confidence        = CONFIDENCE_THRESHOLD
-    frame_count       = 0
     fps_counter       = 0
     fps_start         = time.time()
     fps_display       = 0
-    ocr_tracker       = SpeechTracker(cooldown=OCR_COOLDOWN, stability=OCR_STABILITY)
+    reload_model      = False
 
-    global _ocr_busy
-
-    speak("PathMate started")
+    speak("Object detection started")
 
     try:
         while True:
+            # ── Reload model if user switched ─────────────────
+            if reload_model:
+                print(f"Loading {MODELS[model_idx]} ({MODEL_LABELS[model_idx]})...")
+                speak(f"Switching to {MODEL_LABELS[model_idx]} model")
+                model = YOLO(MODELS[model_idx])
+                reload_model = False
+                print("Model switched.")
+
             ret, frame = cap.read()
             if not ret:
                 print("Camera read failed.")
                 break
 
-            frame_count += 1
+            fh, fw = frame.shape[:2]
+            counts = defaultdict(int)
+            detected_labels = set()
 
-            # ── Object Detection ──────────────────────────────
+            # ── Run YOLO ──────────────────────────────────────
             if detection_enabled:
-                results = model(frame, conf=confidence, verbose=False)[0]
+                results = model(
+                    frame,
+                    conf=confidence,
+                    iou=0.45,         # NMS IoU — reduces duplicate boxes
+                    verbose=False
+                )[0]
+
+                # Sort detections by priority so high-priority objects speak first
+                detections = []
                 for det in results.boxes:
-                    label    = model.names[int(det.cls)]
+                    lbl = model.names[int(det.cls)]
+                    cat = get_category(lbl)
+                    if cat == "other":
+                        continue
+                    detections.append((det, lbl, cat))
+
+                detections.sort(key=lambda x: SPEAK_PRIORITY.get(x[2], 0), reverse=True)
+
+                for det, label, category in detections:
                     conf_val = float(det.conf)
                     box      = det.xyxy[0].tolist()
-                    category = get_category(label)
-                    if category == "other":
-                        continue
-                    draw_detection(frame, box, label, conf_val, category)
-                    if speech_enabled and obj_should_speak(label):
+                    x1, y1, x2, y2 = map(int, box)
+
+                    dist_label, dist_color = get_distance(
+                        (x1, y1, x2, y2), fh, fw
+                    )
+
+                    draw_detection(frame, box, label, conf_val,
+                                   category, dist_label, dist_color)
+
+                    counts[category] += 1
+                    detected_labels.add(label)
+
+                    # Update tracker
+                    tracker.update(detected_labels)
+
+                    # Standard announcement
+                    if speech_enabled and tracker.should_speak(label):
                         speak(f"{label} detected")
 
-            # ── OCR (every N frames, non-blocking) ────────────
-            if ocr_enabled and frame_count % OCR_INTERVAL_FRAMES == 0 and not _ocr_busy:
-                _ocr_busy = True
-                threading.Thread(
-                    target=run_ocr_thread,
-                    args=(frame.copy(),),
-                    daemon=True
-                ).start()
+                    # Proximity warning for high-priority objects
+                    if (proximity_enabled and speech_enabled
+                            and dist_label == "NEAR"
+                            and category in ("person", "vehicle", "traffic_sign")):
+                        if tracker.should_warn_proximity(label):
+                            speak(f"Warning! {label} very close")
 
-            # ── Draw OCR results ──────────────────────────────
-            if ocr_enabled:
-                with _ocr_lock:
-                    current_lines = list(_ocr_lines)
-
-                txt_x = frame.shape[1] - 420
-                txt_y = 30
-                if current_lines:
-                    panel_h = len(current_lines) * 28 + 10
-                    cv2.rectangle(frame,
-                                  (txt_x - 5, 5),
-                                  (frame.shape[1] - 5, panel_h),
-                                  (20, 20, 20), -1)
-                    for line in current_lines:
-                        cv2.putText(frame, line[:45], (txt_x, txt_y),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 180), 2)
-                        txt_y += 28
-
-                if frame_count % OCR_INTERVAL_FRAMES == 0 and speech_enabled and current_lines:
-                    to_speak = ocr_tracker.should_speak(current_lines)
-                    if to_speak:
-                        speak(". ".join(to_speak))
-
-            # ── FPS ───────────────────────────────────────────
+            # ── Overlays ──────────────────────────────────────
             fps_counter += 1
             if time.time() - fps_start >= 1.0:
                 fps_display = fps_counter
@@ -388,25 +414,29 @@ def main():
 
             if SHOW_FPS:
                 cv2.putText(frame, f"FPS: {fps_display}",
-                            (frame.shape[1] - 110, frame.shape[0] - 40),
+                            (fw - 115, fh - 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-            # ── Status bar ────────────────────────────────────
-            det_str = "DET:ON"  if detection_enabled else "DET:OFF"
-            ocr_str = "OCR:ON"  if ocr_enabled       else "OCR:OFF"
-            spk_str = "SPK:ON"  if speech_enabled     else "SPK:OFF"
-            ocr_run = " [scanning...]" if _ocr_busy   else ""
-            cv2.putText(frame,
-                        f"{det_str}  {ocr_str}  {spk_str}  Conf:{confidence:.0%}{ocr_run}",
-                        (10, frame.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             if detection_enabled:
                 draw_legend(frame)
+                if counts_enabled:
+                    draw_counts(frame, counts)
 
-            cv2.imshow("PathMate | Q=Quit  D=Detect  O=OCR  S=Speech", frame)
+            # Status bar
+            flags = []
+            flags.append("DET:ON"  if detection_enabled else "DET:OFF")
+            flags.append("CNT:ON"  if counts_enabled    else "CNT:OFF")
+            flags.append("PROX:ON" if proximity_enabled else "PROX:OFF")
+            flags.append("SPK:ON"  if speech_enabled    else "SPK:OFF")
+            flags.append(f"Conf:{confidence:.0%}")
+            flags.append(f"Model:{MODEL_LABELS[model_idx]}")
+            cv2.putText(frame, "  ".join(flags),
+                        (10, fh - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1)
 
-            # ── Key controls ──────────────────────────────────
+            cv2.imshow("PathMate YOLO | Q=Quit  S=Speech  D=Det  C=Count  P=Prox  M=Model", frame)
+
+            # ── Keys ──────────────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
@@ -420,11 +450,17 @@ def main():
                 status = "ON" if detection_enabled else "OFF"
                 print(f"Detection {status}")
                 speak(f"Detection {status}")
-            elif key == ord('o'):
-                ocr_enabled = not ocr_enabled
-                status = "ON" if ocr_enabled else "OFF"
-                print(f"OCR {status}")
-                speak(f"Text reading {status}")
+            elif key == ord('c'):
+                counts_enabled = not counts_enabled
+                print(f"Count overlay {'ON' if counts_enabled else 'OFF'}")
+            elif key == ord('p'):
+                proximity_enabled = not proximity_enabled
+                status = "ON" if proximity_enabled else "OFF"
+                print(f"Proximity alerts {status}")
+                speak(f"Proximity alerts {status}")
+            elif key == ord('m'):
+                model_idx   = (model_idx + 1) % len(MODELS)
+                reload_model = True
             elif key in (ord('+'), ord('=')):
                 confidence = min(0.95, confidence + 0.05)
                 print(f"Confidence: {confidence:.0%}")
@@ -436,7 +472,7 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         stop_speech()
-        print("PathMate stopped.")
+        print("Detection stopped.")
 
 if __name__ == "__main__":
     main()
