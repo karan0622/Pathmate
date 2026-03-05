@@ -21,6 +21,9 @@ def open_notice():
 def open_navigation():
     subprocess.Popen([sys.executable, "engines/navigation.py"])
 
+def open_bookreader():
+    subprocess.Popen([sys.executable, "/Users/karansingh22/Documents/pathmate/Pathmate/engines/bookreader.py"])
+
 # ---------- Voice Command (REPEATING) ----------
 def listen_command():
     recognizer = sr.Recognizer()
@@ -28,7 +31,7 @@ def listen_command():
     while True:  # 🔁 repeat until valid command
         with sr.Microphone() as source:
             recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            speak("Please say notice or navigation")
+            speak("Please say notice, navigation, or book reading")
 
             try:
                 audio = recognizer.listen(source)  # no timeout
@@ -43,6 +46,11 @@ def listen_command():
                 elif "navigation" in command:
                     speak("Opening navigation")
                     open_navigation()
+                    break
+
+                elif "book" in command or "reading" in command or "book reading" in command:
+                    speak("Opening book reader")
+                    open_bookreader()
                     break
 
                 else:
@@ -60,7 +68,7 @@ def listen_command():
 # ---------- GUI ----------
 root = tk.Tk()
 root.title("PathMate")
-root.geometry("600x400")
+root.geometry("600x500")
 root.configure(bg="black")
 
 # 🔑 FORCE WINDOW TO FRONT (macOS FIX)
@@ -81,7 +89,7 @@ heading.pack(pady=40)
 # ---------- Instruction ----------
 instruction = tk.Label(
     root,
-    text="Say or choose: Notice or Navigation",
+    text="Say or choose: Notice, Navigation, or Book Reading",
     font=("Arial", 14),
     fg="white",
     bg="black"
@@ -109,9 +117,19 @@ btn_navigation = tk.Button(
 )
 btn_navigation.pack(pady=10)
 
+btn_bookreader = tk.Button(
+    root,
+    text="Book Reading",
+    font=("Arial", 16),
+    width=15,
+    height=2,
+    command=open_bookreader
+)
+btn_bookreader.pack(pady=10)
+
 # ---------- Speak on Open ----------
 def welcome():
-    speak("Welcome to your PathMate. Do you want to read notices or want navigation?")
+    speak("Welcome to your PathMate. Do you want to read notices, want navigation, or book reading?")
     threading.Thread(target=listen_command, daemon=True).start()
 
 root.after(1000, welcome)
