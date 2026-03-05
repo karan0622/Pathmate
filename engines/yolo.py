@@ -1,7 +1,12 @@
 """
-PathMate — YOLO Object Detector (Enhanced)
-============================================
-Improvements over v1:
+PathMate — YOLO Object Detector (Cross-Platform)
+==================================================
+Cross-platform TTS support:
+  • macOS   → built-in `say` command (Samantha voice)
+  • Windows → pyttsx3 (SAPI5)  |  pip install pyttsx3
+  • Linux   → espeak (if installed)  OR  pyttsx3 fallback
+
+All other features from v2:
   • YOLOv8s model (small) — better accuracy than nano
   • Object counting per category shown on screen
   • Distance estimation (near / medium / far) by box size
@@ -12,8 +17,7 @@ Improvements over v1:
   • Cleaner bounding box UI with rounded corners + drop shadow
 
 Requirements:
-    pip install ultralytics opencv-python
-    Mac speech via built-in `say` command (no extra install)
+    pip install ultralytics opencv-python pyttsx3
 
 Controls:
     Q      →  Quit
@@ -30,8 +34,15 @@ import threading
 import queue
 import time
 import subprocess
-from collections import defaultdict, deque
+import platform
+import sys
+from collections import defaultdict
 from ultralytics import YOLO
+
+# ─────────────────────────────────────────────
+# PLATFORM DETECTION
+# ─────────────────────────────────────────────
+OS = platform.system()   # "Darwin", "Windows", "Linux"
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -41,7 +52,7 @@ SPEAK_COOLDOWN       = 4       # seconds before same object is re-announced
 PROXIMITY_COOLDOWN   = 3       # seconds between proximity warnings
 CAMERA_INDEX         = 0
 SHOW_FPS             = True
-DEFAULT_MODEL        = "yolov8s.pt"   # s = small (better than nano)
+DEFAULT_MODEL        = "yolov8s.pt"
 MODELS               = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"]
 MODEL_LABELS         = ["Nano", "Small", "Medium"]
 
@@ -71,7 +82,6 @@ PERSONS = ["person"]
 PLANTS  = ["potted plant", "vase"]
 BOOKS   = ["book"]
 
-# Priority order for speech (higher = spoken sooner when multiple detections)
 SPEAK_PRIORITY = {
     "person":       5,
     "vehicle":      4,
@@ -94,12 +104,27 @@ CATEGORY_COLORS = {
 }
 
 # ─────────────────────────────────────────────
-# SPEECH ENGINE  (Mac `say` — single thread)
+# CROSS-PLATFORM SPEECH ENGINE
 # ─────────────────────────────────────────────
-_speech_queue = queue.Queue(maxsize=3)
-_speech_stop  = threading.Event()
 
-def _speak_mac(text: str):
+# Try to import pyttsx3 for Windows/Linux fallback
+_pyttsx3_engine = None
+_pyttsx3_lock   = threading.Lock()
+
+def _init_pyttsx3():
+    global _pyttsx3_engine
+    try:
+        import pyttsx3
+        _pyttsx3_engine = pyttsx3.init()
+        _pyttsx3_engine.setProperty("rate", 210)
+        print("[TTS] pyttsx3 initialised successfully.")
+    except Exception as e:
+        print(f"[TTS] pyttsx3 init failed: {e}")
+        _pyttsx3_engine = None
+
+
+def _speak_macos(text: str):
+    """Use macOS built-in `say` command."""
     try:
         subprocess.run(
             ["say", "-r", "210", "-v", "Samantha", text],
@@ -110,6 +135,52 @@ def _speak_mac(text: str):
     except Exception as e:
         print(f"[TTS Error] {e}")
 
+
+def _speak_linux(text: str):
+    """Try espeak on Linux; fall back to pyttsx3."""
+    try:
+        subprocess.run(
+            ["espeak", "-s", "210", text],
+            check=True, timeout=15
+        )
+    except FileNotFoundError:
+        # espeak not installed — use pyttsx3
+        _speak_pyttsx3(text)
+    except subprocess.TimeoutExpired:
+        print("[TTS] Timeout — skipping")
+    except Exception as e:
+        print(f"[TTS Error] {e}")
+
+
+def _speak_pyttsx3(text: str):
+    """Windows (and Linux fallback) via pyttsx3."""
+    global _pyttsx3_engine
+    if _pyttsx3_engine is None:
+        print("[TTS] pyttsx3 not available — skipping speech.")
+        return
+    try:
+        with _pyttsx3_lock:
+            _pyttsx3_engine.say(text)
+            _pyttsx3_engine.runAndWait()
+    except Exception as e:
+        print(f"[TTS Error] {e}")
+
+
+def _speak(text: str):
+    """Dispatch to the correct TTS backend for the current OS."""
+    if OS == "Darwin":
+        _speak_macos(text)
+    elif OS == "Windows":
+        _speak_pyttsx3(text)
+    else:   # Linux / other
+        _speak_linux(text)
+
+
+# ── Speech worker thread ──────────────────────
+_speech_queue = queue.Queue(maxsize=3)
+_speech_stop  = threading.Event()
+
+
 def _speech_worker():
     while not _speech_stop.is_set():
         try:
@@ -117,7 +188,7 @@ def _speech_worker():
             if text is None:
                 break
             if _speech_queue.empty():
-                _speak_mac(text)
+                _speak(text)
             else:
                 print(f"[TTS] Skipped stale: {text[:40]}")
             _speech_queue.task_done()
@@ -126,7 +197,9 @@ def _speech_worker():
         except Exception as e:
             print(f"[TTS Worker Error] {e}")
 
+
 threading.Thread(target=_speech_worker, daemon=True).start()
+
 
 def speak(text: str):
     try:
@@ -140,6 +213,7 @@ def speak(text: str):
             _speech_queue.put_nowait(text)
         except queue.Full:
             pass
+
 
 def stop_speech():
     _speech_stop.set()
@@ -162,8 +236,10 @@ def get_category(label: str) -> str:
     if l in BOOKS:                 return "book"
     return "other"
 
+
 def get_color(category: str):
     return CATEGORY_COLORS.get(category, CATEGORY_COLORS["other"])
+
 
 def get_distance(box, frame_h, frame_w):
     x1, y1, x2, y2 = box
@@ -178,24 +254,19 @@ def get_distance(box, frame_h, frame_w):
         return "FAR",  (0, 220, 0)
 
 # ─────────────────────────────────────────────
-# OBJECT TRACKER  (smoothing across frames)
-# Keeps a short history of detections per label
-# to avoid flickering announcements
+# OBJECT TRACKER
 # ─────────────────────────────────────────────
 class ObjectTracker:
     def __init__(self, cooldown=4.0, confirm_frames=2):
-        self.spoken        = {}          # label → last spoken time
-        self.seen_frames   = defaultdict(int)   # label → consecutive frames seen
-        self.confirm       = confirm_frames      # frames needed before announcing
-        self.cooldown      = cooldown
-        self.prox_spoken   = {}          # label → last proximity warning time
+        self.spoken      = {}
+        self.seen_frames = defaultdict(int)
+        self.confirm     = confirm_frames
+        self.cooldown    = cooldown
+        self.prox_spoken = {}
 
     def update(self, detected_labels: set):
-        """Call once per frame with set of currently visible labels."""
-        # Increment seen count for visible labels
         for lbl in detected_labels:
             self.seen_frames[lbl] += 1
-        # Reset count for labels that disappeared
         gone = [l for l in self.seen_frames if l not in detected_labels]
         for l in gone:
             self.seen_frames[l] = 0
@@ -216,50 +287,46 @@ class ObjectTracker:
             return True
         return False
 
+
 tracker = ObjectTracker(cooldown=SPEAK_COOLDOWN, confirm_frames=2)
 
 # ─────────────────────────────────────────────
 # DRAWING HELPERS
 # ─────────────────────────────────────────────
 def draw_rounded_rect(img, pt1, pt2, color, thickness=2, r=10):
-    """Draw a rectangle with slightly rounded corners."""
     x1, y1 = pt1
     x2, y2 = pt2
-    # Sides
-    cv2.line(img,  (x1 + r, y1), (x2 - r, y1), color, thickness)
-    cv2.line(img,  (x1 + r, y2), (x2 - r, y2), color, thickness)
-    cv2.line(img,  (x1, y1 + r), (x1, y2 - r), color, thickness)
-    cv2.line(img,  (x2, y1 + r), (x2, y2 - r), color, thickness)
-    # Corners
-    cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 180, 0, 90,  color, thickness)
-    cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 270, 0, 90,  color, thickness)
-    cv2.ellipse(img, (x1 + r, y2 - r), (r, r), 90,  0, 90,  color, thickness)
-    cv2.ellipse(img, (x2 - r, y2 - r), (r, r), 0,   0, 90,  color, thickness)
+    cv2.line(img, (x1 + r, y1), (x2 - r, y1), color, thickness)
+    cv2.line(img, (x1 + r, y2), (x2 - r, y2), color, thickness)
+    cv2.line(img, (x1, y1 + r), (x1, y2 - r), color, thickness)
+    cv2.line(img, (x2, y1 + r), (x2, y2 - r), color, thickness)
+    cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 180, 0, 90, color, thickness)
+    cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 270, 0, 90, color, thickness)
+    cv2.ellipse(img, (x1 + r, y2 - r), (r, r), 90,  0, 90, color, thickness)
+    cv2.ellipse(img, (x2 - r, y2 - r), (r, r), 0,   0, 90, color, thickness)
+
 
 def draw_detection(frame, box, label, confidence, category, dist_label, dist_color):
     x1, y1, x2, y2 = map(int, box)
     color = get_color(category)
 
-    # Subtle filled shadow
     overlay = frame.copy()
     cv2.rectangle(overlay, (x1 + 3, y1 + 3), (x2 + 3, y2 + 3), (0, 0, 0), 2)
     cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
 
-    # Rounded bounding box
     draw_rounded_rect(frame, (x1, y1), (x2, y2), color, thickness=2)
 
-    # Label pill (top-left)
     txt = f"{label}  {confidence:.0%}"
     (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
     cv2.rectangle(frame, (x1, y1 - th - 12), (x1 + tw + 10, y1), color, -1)
     cv2.putText(frame, txt, (x1 + 5, y1 - 5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
 
-    # Distance badge (bottom-right of box)
     (dw, dh), _ = cv2.getTextSize(dist_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
     cv2.rectangle(frame, (x2 - dw - 10, y2 - dh - 8), (x2, y2), dist_color, -1)
     cv2.putText(frame, dist_label, (x2 - dw - 5, y2 - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
 
 def draw_legend(frame):
     items = [
@@ -280,8 +347,8 @@ def draw_legend(frame):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1)
         y += 22
 
+
 def draw_counts(frame, counts: dict):
-    """Show per-category count in top-right corner."""
     active = {k: v for k, v in counts.items() if v > 0}
     if not active:
         return
@@ -300,8 +367,13 @@ def draw_counts(frame, counts: dict):
 # ─────────────────────────────────────────────
 def main():
     print("=" * 60)
-    print("  PathMate — Enhanced YOLO Object Detector")
+    print("  PathMate — Cross-Platform YOLO Object Detector")
+    print(f"  Platform: {OS}")
     print("=" * 60)
+
+    # Initialise pyttsx3 for Windows (and Linux fallback)
+    if OS in ("Windows", "Linux"):
+        _init_pyttsx3()
 
     model_idx = MODELS.index(DEFAULT_MODEL)
     print(f"Loading model: {MODELS[model_idx]} ({MODEL_LABELS[model_idx]})...")
@@ -361,11 +433,10 @@ def main():
                 results = model(
                     frame,
                     conf=confidence,
-                    iou=0.45,         # NMS IoU — reduces duplicate boxes
+                    iou=0.45,
                     verbose=False
                 )[0]
 
-                # Sort detections by priority so high-priority objects speak first
                 detections = []
                 for det in results.boxes:
                     lbl = model.names[int(det.cls)]
@@ -374,7 +445,9 @@ def main():
                         continue
                     detections.append((det, lbl, cat))
 
-                detections.sort(key=lambda x: SPEAK_PRIORITY.get(x[2], 0), reverse=True)
+                detections.sort(
+                    key=lambda x: SPEAK_PRIORITY.get(x[2], 0), reverse=True
+                )
 
                 for det, label, category in detections:
                     conf_val = float(det.conf)
@@ -391,14 +464,16 @@ def main():
                     counts[category] += 1
                     detected_labels.add(label)
 
-                    # Update tracker
-                    tracker.update(detected_labels)
+                tracker.update(detected_labels)
 
-                    # Standard announcement
+                for det, label, category in detections:
+                    box    = det.xyxy[0].tolist()
+                    x1, y1, x2, y2 = map(int, box)
+                    dist_label, _ = get_distance((x1, y1, x2, y2), fh, fw)
+
                     if speech_enabled and tracker.should_speak(label):
                         speak(f"{label} detected")
 
-                    # Proximity warning for high-priority objects
                     if (proximity_enabled and speech_enabled
                             and dist_label == "NEAR"
                             and category in ("person", "vehicle", "traffic_sign")):
@@ -422,7 +497,6 @@ def main():
                 if counts_enabled:
                     draw_counts(frame, counts)
 
-            # Status bar
             flags = []
             flags.append("DET:ON"  if detection_enabled else "DET:OFF")
             flags.append("CNT:ON"  if counts_enabled    else "CNT:OFF")
@@ -430,11 +504,15 @@ def main():
             flags.append("SPK:ON"  if speech_enabled    else "SPK:OFF")
             flags.append(f"Conf:{confidence:.0%}")
             flags.append(f"Model:{MODEL_LABELS[model_idx]}")
+            flags.append(f"OS:{OS}")
             cv2.putText(frame, "  ".join(flags),
                         (10, fh - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1)
 
-            cv2.imshow("PathMate YOLO | Q=Quit  S=Speech  D=Det  C=Count  P=Prox  M=Model", frame)
+            cv2.imshow(
+                "PathMate YOLO | Q=Quit  S=Speech  D=Det  C=Count  P=Prox  M=Model",
+                frame
+            )
 
             # ── Keys ──────────────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
@@ -459,7 +537,7 @@ def main():
                 print(f"Proximity alerts {status}")
                 speak(f"Proximity alerts {status}")
             elif key == ord('m'):
-                model_idx   = (model_idx + 1) % len(MODELS)
+                model_idx    = (model_idx + 1) % len(MODELS)
                 reload_model = True
             elif key in (ord('+'), ord('=')):
                 confidence = min(0.95, confidence + 0.05)
@@ -473,6 +551,7 @@ def main():
         cv2.destroyAllWindows()
         stop_speech()
         print("Detection stopped.")
+
 
 if __name__ == "__main__":
     main()
