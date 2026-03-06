@@ -16,6 +16,14 @@ All other features from v2:
   • Non-max suppression tuned (less duplicate boxes)
   • Cleaner bounding box UI with rounded corners + drop shadow
 
+Stair Detection v2 improvements:
+  • CLAHE pre-processing for better contrast in dark/bright environments
+  • ROI locked to bottom 70% of frame (avoids false positives from ceilings)
+  • Duplicate line merging via y-clustering
+  • Regularity score — real stairs have evenly spaced lines
+  • Vanishing-point heuristic for UP/DOWN direction
+  • Visual confidence bar on screen
+
 Requirements:
     pip install ultralytics opencv-python pyttsx3
 
@@ -28,7 +36,8 @@ Controls:
     + / -  →  Confidence threshold up / down
     M      →  Cycle model  (nano → small → medium)
 """
-
+import numpy as np
+import math
 import cv2
 import threading
 import queue
@@ -144,7 +153,6 @@ def _speak_linux(text: str):
             check=True, timeout=15
         )
     except FileNotFoundError:
-        # espeak not installed — use pyttsx3
         _speak_pyttsx3(text)
     except subprocess.TimeoutExpired:
         print("[TTS] Timeout — skipping")
@@ -172,7 +180,7 @@ def _speak(text: str):
         _speak_macos(text)
     elif OS == "Windows":
         _speak_pyttsx3(text)
-    else:   # Linux / other
+    else:
         _speak_linux(text)
 
 
@@ -252,6 +260,201 @@ def get_distance(box, frame_h, frame_w):
         return "MED",  (0, 165, 255)
     else:
         return "FAR",  (0, 220, 0)
+
+
+# ─────────────────────────────────────────────
+# STAIR DETECTION MODULE v2 — improved accuracy
+# ─────────────────────────────────────────────
+
+# Tuning constants
+STAIR_MIN_LINE_LENGTH  = 80    # px — shorter lines ignored
+STAIR_MAX_LINE_GAP     = 15    # px — gap between collinear segments
+STAIR_HOUGH_THRESHOLD  = 80    # votes needed in Hough transform
+STAIR_HORIZ_ANGLE      = 18    # degrees — max deviation from horizontal
+STAIR_MIN_LINES        = 4     # need at least this many step lines
+STAIR_MIN_SPACING      = 10    # px — min vertical gap between step lines
+STAIR_MAX_SPACING      = 120   # px — max vertical gap between step lines
+STAIR_REGULARITY_TOL   = 0.45  # 0–1, lower = stricter regularity check
+STAIR_SPEAK_COOLDOWN   = 4.0   # seconds between stair speech announcements
+_last_stair_speak      = 0.0
+
+
+def _cluster_lines_by_y(lines, gap=12):
+    """
+    Merge near-duplicate horizontal lines that differ only by a few pixels.
+    Returns one representative (mean-y) line per cluster.
+    """
+    if not lines:
+        return []
+    lines_sorted = sorted(lines, key=lambda l: l[1])
+    clusters = [[lines_sorted[0]]]
+    for line in lines_sorted[1:]:
+        if abs(line[1] - clusters[-1][-1][1]) <= gap:
+            clusters[-1].append(line)
+        else:
+            clusters.append([line])
+    merged = []
+    for cluster in clusters:
+        ys  = [l[1] for l in cluster]
+        x1s = [l[0] for l in cluster]
+        x2s = [l[2] for l in cluster]
+        merged.append((int(np.mean(x1s)), int(np.mean(ys)),
+                       int(np.mean(x2s)), int(np.mean(ys))))
+    return merged
+
+
+def _spacing_regularity(y_positions):
+    """
+    Returns a regularity score 0–1.
+    1 = perfectly evenly spaced (real stairs).
+    0 = random spacing (noise).
+    """
+    if len(y_positions) < 3:
+        return 0.0
+    gaps = np.diff(sorted(y_positions))
+    if np.mean(gaps) == 0:
+        return 0.0
+    cv_score = np.std(gaps) / np.mean(gaps)   # coefficient of variation
+    return float(np.clip(1.0 - cv_score, 0.0, 1.0))
+
+
+def detect_stairs(frame):
+    """
+    Improved stair detector v2.
+
+    Changes vs v1:
+      - CLAHE pre-processing handles dark corridors / bright outdoor scenes
+      - ROI restricted to bottom 70% — avoids ceiling/shelf false positives
+      - Duplicate lines merged by y-clustering before counting steps
+      - Spacing validity check: gaps must be in [STAIR_MIN_SPACING, STAIR_MAX_SPACING]
+      - Regularity score gates detection — random lines are rejected
+      - Vanishing-point heuristic improves UP/DOWN classification
+      - Visual confidence bar drawn on frame
+
+    Returns
+    -------
+    frame       : annotated frame
+    step_count  : number of confirmed step lines (0 if no stairs detected)
+    direction   : "UP", "DOWN", or None
+    """
+    global _last_stair_speak
+
+    fh, fw = frame.shape[:2]
+
+    # ── 1. Pre-process ──────────────────────────────────────────
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Adaptive histogram equalisation — improves contrast in varied lighting
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray  = clahe.apply(gray)
+
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Auto Canny thresholds derived from median pixel intensity
+    med   = float(np.median(blur))
+    lower = int(max(0,   0.66 * med))
+    upper = int(min(255, 1.33 * med))
+    edges = cv2.Canny(blur, lower, upper)
+
+    # Focus on the bottom 70% of the frame — stairs are underfoot
+    roi_top = int(fh * 0.30)
+    roi     = edges[roi_top:, :]
+
+    # ── 2. Hough line detection ──────────────────────────────────
+    lines = cv2.HoughLinesP(
+        roi,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=STAIR_HOUGH_THRESHOLD,
+        minLineLength=STAIR_MIN_LINE_LENGTH,
+        maxLineGap=STAIR_MAX_LINE_GAP,
+    )
+
+    if lines is None:
+        return frame, 0, None
+
+    # ── 3. Keep only near-horizontal lines ──────────────────────
+    horizontal = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
+        if angle <= STAIR_HORIZ_ANGLE or angle >= (180 - STAIR_HORIZ_ANGLE):
+            # Restore absolute y coordinate (offset by ROI top)
+            horizontal.append((x1, y1 + roi_top, x2, y2 + roi_top))
+
+    if len(horizontal) < STAIR_MIN_LINES:
+        return frame, 0, None
+
+    # ── 4. Merge duplicate lines + filter by realistic spacing ───
+    merged = _cluster_lines_by_y(horizontal, gap=12)
+
+    merged_sorted = sorted(merged, key=lambda l: l[1])
+    valid = [merged_sorted[0]]
+    for line in merged_sorted[1:]:
+        spacing = abs(line[1] - valid[-1][1])
+        if STAIR_MIN_SPACING <= spacing <= STAIR_MAX_SPACING:
+            valid.append(line)
+
+    if len(valid) < STAIR_MIN_LINES:
+        return frame, 0, None
+
+    # ── 5. Regularity check — real stairs are evenly spaced ──────
+    y_vals     = [l[1] for l in valid]
+    regularity = _spacing_regularity(y_vals)
+
+    if regularity < (1.0 - STAIR_REGULARITY_TOL):
+        # Too irregular — likely furniture, shelves, or noise
+        return frame, 0, None
+
+    step_count = len(valid)
+
+    # ── 6. Direction inference ───────────────────────────────────
+    # Primary: mean y position relative to frame midpoint
+    mean_y = np.mean(y_vals)
+    mid_y  = fh * 0.55
+    direction = "UP" if mean_y < mid_y else "DOWN"
+
+    # Refinement: vanishing-point heuristic
+    # If lines in the upper portion are shorter than lower → converging upward → ascending
+    top_lines = [l for l in valid if l[1] < mid_y]
+    bot_lines = [l for l in valid if l[1] >= mid_y]
+
+    def mean_length(ls):
+        if not ls:
+            return 0
+        return np.mean([abs(l[2] - l[0]) for l in ls])
+
+    top_len = mean_length(top_lines)
+    bot_len = mean_length(bot_lines)
+
+    if top_len > 0 and bot_len > 0:
+        if top_len < bot_len * 0.7:
+            direction = "UP"    # lines get shorter toward top → ascending
+        elif bot_len < top_len * 0.7:
+            direction = "DOWN"  # lines get shorter toward bottom → descending
+
+    # ── 7. Draw annotations ──────────────────────────────────────
+    for (x1, y1, x2, y2) in valid:
+        cv2.line(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
+
+    label_txt = f"STAIRS {direction} | Steps ~{step_count}  Reg:{regularity:.2f}"
+    cv2.putText(
+        frame, label_txt,
+        (20, fh - 60),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+        (255, 0, 255), 2,
+    )
+
+    # Confidence bar (regularity score visualised as a progress bar)
+    bar_w = int(200 * regularity)
+    cv2.rectangle(frame, (20, fh - 40), (220, fh - 24), (60, 60, 60), -1)
+    cv2.rectangle(frame, (20, fh - 40), (20 + bar_w, fh - 24), (255, 0, 255), -1)
+    cv2.putText(frame, "Stair confidence",
+                (20, fh - 44),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+
+    return frame, step_count, direction
+
 
 # ─────────────────────────────────────────────
 # OBJECT TRACKER
@@ -362,6 +565,7 @@ def draw_counts(frame, counts: dict):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
         y += 22
 
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -371,7 +575,6 @@ def main():
     print(f"  Platform: {OS}")
     print("=" * 60)
 
-    # Initialise pyttsx3 for Windows (and Linux fallback)
     if OS in ("Windows", "Linux"):
         _init_pyttsx3()
 
@@ -423,6 +626,17 @@ def main():
             if not ret:
                 print("Camera read failed.")
                 break
+
+            # ── Stair detection ───────────────────────────────
+            frame, stair_count, stair_direction = detect_stairs(frame)
+
+            if stair_count >= STAIR_MIN_LINES:
+                if speech_enabled:
+                    now = time.time()
+                    global _last_stair_speak
+                    if now - _last_stair_speak > STAIR_SPEAK_COOLDOWN:
+                        _last_stair_speak = now
+                        speak(f"Stairs detected going {stair_direction}. Approximately {stair_count} steps")
 
             fh, fw = frame.shape[:2]
             counts = defaultdict(int)
