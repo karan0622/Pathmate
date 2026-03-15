@@ -2,6 +2,7 @@ import cv2
 import pytesseract
 import pyttsx3
 from PIL import Image
+import time
 
 # -------- Initialize TTS ONCE --------
 engine = pyttsx3.init()

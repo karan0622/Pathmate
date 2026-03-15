@@ -206,9 +206,9 @@ def main():
     print("  PathMate — Live OCR Text Reader")
     print("=" * 55)
     print("Controls:")
-    print("  Q  →  Quit")
-    print("  S  →  Toggle speech")
-    print("  O  →  Toggle OCR")
+    print("  Q  ->  Quit")
+    print("  S  ->  Toggle speech")
+    print("  O  -> Toggle OCR")
     print("=" * 55)
 
     cap = cv2.VideoCapture(CAMERA_INDEX)

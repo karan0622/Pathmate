@@ -34,16 +34,7 @@ def generate_directions(path):
     for neighbour, distance in CAMPUS_MAP[current]:
       if neighbour == next_place:
         step = f"Walk from {current} to {next_place} - about {distance} steps"
-        directions.append(step)
+        directions.append((step, next_place))#return tuple
   
-  directions.append(f"You have arrived at {path[-1]}")
+    directions.append((f"You have arrived at {path[-1]}", path[-1]))
   return directions
-
-if __name__ == "__main__":
-  path = find_path("ENTRANCE", "B-202")
-  if path:
-    directions = generate_directions(path)
-    for step in directions:
-      print(step)
-  else:
-    print("No path found")
